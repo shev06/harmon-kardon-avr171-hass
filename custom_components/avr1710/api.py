@@ -280,12 +280,19 @@ class AVR1710Client:
     # Combined status (used by the DataUpdateCoordinator)
     # ---------------------------------------------------------------
 
-    async def async_update_status(self) -> AVR1710Status:
+    async def async_update_status(self, previous: AVR1710Status | None = None) -> AVR1710Status:
         """Poll both surfaces and return a best-effort combined snapshot.
 
-        Raises AVR1710ConnectionError only if BOTH surfaces are unreachable
-        (i.e. the receiver appears fully off the network); a failure on just
-        one surface degrades gracefully instead of failing the whole update.
+        `previous` is the last successfully-merged snapshot (if any). When a
+        surface fails on this particular poll, its fields are carried
+        forward from `previous` instead of being reset to None/unknown --
+        this matters because TCP:10025 only accepts one client at a time
+        (confirmed via live testing), so any single poll can transiently
+        fail there even while the receiver is genuinely on with a known
+        source. Without this carry-forward, every such hiccup would wipe
+        power/source (or volume/mute/transport) back to unknown, even
+        though the overall update below still counts as a "success" (it
+        only raises if BOTH surfaces are unreachable).
         """
         status = AVR1710Status()
         control_ok = True
@@ -296,10 +303,10 @@ class AVR1710Client:
             if status.power_on:
                 status.source = await self.get_source()
         except AVR1710ConnectionError:
-            # Leave power_on as None (unknown) rather than assuming "off" --
-            # see AVR1710Status.is_likely_on for why. control_ok=False still
-            # lets async_update_status know this surface specifically failed.
             control_ok = False
+            if previous is not None:
+                status.power_on = previous.power_on
+                status.source = previous.source
 
         try:
             status.volume = await self.get_volume()
@@ -307,6 +314,10 @@ class AVR1710Client:
             status.transport_state = await self.get_transport_state()
         except AVR1710ConnectionError:
             dlna_ok = False
+            if previous is not None:
+                status.volume = previous.volume
+                status.muted = previous.muted
+                status.transport_state = previous.transport_state
 
         if not control_ok and not dlna_ok:
             raise AVR1710ConnectionError(f"Cannot reach {self._host} on either network surface")

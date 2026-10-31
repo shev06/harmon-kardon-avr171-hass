@@ -29,6 +29,6 @@ class AVR1710Coordinator(DataUpdateCoordinator[AVR1710Status]):
 
     async def _async_update_data(self) -> AVR1710Status:
         try:
-            return await self.client.async_update_status()
+            return await self.client.async_update_status(previous=self.data)
         except AVR1710ConnectionError as err:
             raise UpdateFailed(str(err)) from err

@@ -56,7 +56,10 @@ data:
   reply, and closes immediately — it never holds the port open — but it
   still can't win against another client already occupying the single
   slot. If `power`/`source` look stuck or unavailable, check for another
-  open connection to port 10025 first.
+  open connection to port 10025 first. Since v1.0.1, a single refused poll
+  no longer resets `power`/`source` (or `volume`/`mute`/`transport` if DLNA
+  has the hiccup instead) back to unknown — the last known-good value is
+  kept until the next successful poll updates it.
 - **When the control port can't be reached at all**, this integration
   does **not** assume the receiver is off (live testing showed the port
   can refuse connections even while the receiver is genuinely on). Instead
