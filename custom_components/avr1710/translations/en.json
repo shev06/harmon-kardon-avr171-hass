@@ -3,17 +3,16 @@
     "step": {
       "user": {
         "title": "Connect to Harman Kardon AVR 1710",
-        "description": "Enter your receiver's IP address. Both the proprietary TCP:10025 control API (power/source) and the DLNA/UPnP port 8080 API (volume/mute/transport) are used automatically.",
+        "description": "Enter your receiver's IP address. Uses the proprietary TCP:10025 control API for power, source, volume, mute, and transport control.",
         "data": {
           "host": "Host (IP address)",
           "name": "Name",
-          "control_port": "Control port (TCP:10025)",
-          "dlna_port": "DLNA port"
+          "control_port": "Control port (TCP:10025)"
         }
       }
     },
     "error": {
-      "cannot_connect": "Cannot connect to the receiver on either network API. Check the IP address and that the receiver is powered on.",
+      "cannot_connect": "Cannot connect to the receiver. Check the IP address and that the receiver is powered on.",
       "unknown": "Unexpected error"
     },
     "abort": {

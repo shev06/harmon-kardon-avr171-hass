@@ -1,35 +1,33 @@
-"""Async client for the Harman Kardon AVR 1710's two network control surfaces.
+"""Async client for the Harman Kardon AVR 1710's proprietary TCP:10025 dispatcher.
 
 This module is intentionally free of any `homeassistant` imports so it can be
 unit-tested (or run live against a real receiver) completely standalone.
 
-Two independent, already-shipping network APIs are combined here:
+TCP:10025 is a proprietary dispatcher reverse-engineered from the receiver's
+own firmware (FUN_08049d90 / FUN_08044dc4), hosted on the receiver's main
+STM32 MCU. It provides: power on/off/toggle, 24 named source inputs,
+query-status for live power/source state, relative volume step (up/down,
+no absolute set), mute on/off/toggle (write-only, no readback), play/pause/
+next/previous (write-only, no "stop" command exists), and ~20 other simple
+remote-button-style commands (menu/tone/delay/etc.).
 
-1. TCP:10025 "proprietary dispatcher" -- reverse-engineered from the
-   receiver's own firmware (FUN_08049d90 / FUN_08044dc4). Hosted on the
-   receiver's main STM32 MCU. This is the richest control surface: power
-   on/off/toggle, 24 named source inputs, and ~20 remote-button-style
-   commands (transport/menu/tone/etc.), plus `query-status` for live
-   power/source state.
+This integration previously also used the receiver's separate DLNA/UPnP
+surface (port 8080, a different BridgeCo chip) to get real numeric volume
+and boolean mute state, since the dispatcher's own query-status replies for
+those two fields are permanently empty by firmware design (those specific
+call sites never compute a value to send -- confirmed via static analysis).
+DLNA was intentionally dropped (by explicit user choice) to reduce the
+integration down to a single network surface; the trade-off is that volume
+level and mute state can be commanded but never read back, and fine-grained
+transport state (playing/paused/idle) isn't available at all.
 
-   IMPORTANT, confirmed via live testing against a real device: this port
-   is only reliably reachable while the STM32 is NOT in its low-power STOP
-   sleep state. When the receiver has been in standby for a while, TCP
-   connections to :10025 can be refused -- this is a real firmware
-   characteristic (the MCU gates its own peripheral clocks on sleep entry),
-   not a bug in this client. Connection failures here are treated as
-   "receiver is asleep/off", not surfaced as hard errors.
-
-2. DLNA/UPnP (port 8080), hosted on a separate BridgeCo CE2DM870 media
-   bridge chip. Standard MediaRenderer:1 services (RenderingControl,
-   AVTransport, ConnectionManager). This chip appears to stay reachable
-   independently of the main MCU's sleep state, and is the only channel
-   that returns real numeric volume / boolean mute state -- the
-   proprietary dispatcher's query-status replies for volume/mute are
-   permanently empty by firmware design (those dispatcher call sites never
-   compute a value to send). So DLNA is used here for volume/mute/transport
-   get+set, while the proprietary dispatcher is used for power/source/
-   button-style commands.
+IMPORTANT, confirmed via live testing against a real device: this port is
+only reliably reachable while the STM32 is NOT in its low-power STOP sleep
+state, AND it only accepts one client connection at a time -- any other
+open connection (another app, a manual telnet/nc session, or even this same
+integration's own periodic poll racing a manual command) will cause other
+connection attempts to be refused. `send_command` below serializes all
+calls through a lock and retries a few times to absorb this.
 """
 from __future__ import annotations
 
@@ -38,11 +36,14 @@ import contextlib
 import re
 from dataclasses import dataclass
 
-import aiohttp
-
 CONTROL_PORT_DEFAULT = 10025
-DLNA_PORT_DEFAULT = 8080
 TIMEOUT = 5
+# See the module docstring: the dispatcher only accepts one client at a time,
+# so this integration's own periodic poll and any user-triggered command can
+# race each other (and any external client) for that single slot and lose,
+# even though the receiver is genuinely reachable and on.
+CONTROL_RETRY_ATTEMPTS = 3
+CONTROL_RETRY_DELAY = 0.4  # seconds between retries
 
 _TAG_PATTERNS = {
     "name": re.compile(r"<name>(.*?)</name>", re.S),
@@ -52,37 +53,26 @@ _TAG_PATTERNS = {
 
 
 class AVR1710ConnectionError(Exception):
-    """Raised when a network surface cannot be reached at all."""
+    """Raised when the control port cannot be reached at all."""
 
 
 @dataclass
 class AVR1710Status:
-    """Combined, best-effort snapshot of both network surfaces."""
+    """Snapshot of dispatcher-reported state."""
 
     power_on: bool | None = None
     source: str | None = None
-    volume: int | None = None  # 0-100, from DLNA
-    muted: bool | None = None  # from DLNA
-    transport_state: str | None = None  # from DLNA AVTransport (e.g. PLAYING)
 
     @property
     def is_likely_on(self) -> bool:
-        """Best-effort on/off determination for display purposes.
+        """True only when the control port has confirmed the receiver is on.
 
-        `power_on` is authoritative when known (a real reply was received
-        from TCP:10025 query-status/power). When the control port could not
-        be reached at all, this deliberately does NOT assume "off": live
-        testing showed the control port can refuse connections even while
-        the receiver is genuinely on -- e.g. it appears to serve only one
-        client at a time, so any other open connection (another app, a
-        manual telnet/nc session, etc.) will cause every other client's
-        attempt to be refused regardless of power state. In that situation,
-        any successful DLNA reply is treated as evidence the receiver has
-        power and is in use.
+        There is only one source of truth now (TCP:10025's query-status/
+        power); if it's unknown (control port unreachable even after
+        `send_command`'s retries), this conservatively reports "not on"
+        rather than guessing from a second surface.
         """
-        if self.power_on is not None:
-            return self.power_on
-        return self.volume is not None or self.muted is not None or self.transport_state is not None
+        return bool(self.power_on)
 
 
 def _build_control_message(name: str, host: str, port: int, zone: str = "", para: str = "") -> bytes:
@@ -108,33 +98,21 @@ def _build_control_message(name: str, host: str, port: int, zone: str = "", para
 
 
 class AVR1710Client:
-    """Combines the TCP:10025 command dispatcher and DLNA/UPnP control."""
+    """Client for the TCP:10025 proprietary command dispatcher."""
 
-    def __init__(
-        self,
-        host: str,
-        control_port: int = CONTROL_PORT_DEFAULT,
-        dlna_port: int = DLNA_PORT_DEFAULT,
-        session: aiohttp.ClientSession | None = None,
-    ) -> None:
+    def __init__(self, host: str, control_port: int = CONTROL_PORT_DEFAULT) -> None:
         self._host = host
         self._control_port = control_port
-        self._dlna_port = dlna_port
-        self._session = session
-        self._owns_session = session is None
-
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None:
-            self._session = aiohttp.ClientSession()
-        return self._session
+        # Serializes ALL control-port traffic (reads and writes alike) so
+        # this integration never contends with itself for the receiver's
+        # single TCP:10025 client slot -- see CONTROL_RETRY_ATTEMPTS above.
+        self._control_lock = asyncio.Lock()
 
     async def close(self) -> None:
-        if self._owns_session and self._session is not None:
-            await self._session.close()
-            self._session = None
+        """No persistent resources to release; kept for API symmetry with callers."""
 
     # ---------------------------------------------------------------
-    # TCP:10025 proprietary dispatcher
+    # Low-level dispatcher I/O
     # ---------------------------------------------------------------
 
     async def send_command(self, name: str, zone: str = "", para: str = "") -> dict[str, str]:
@@ -145,29 +123,50 @@ class AVR1710Client:
         mismatched in the real firmware -- so this uses simple regex
         extraction rather than an XML parser).
 
-        Raises AVR1710ConnectionError if the socket can't be reached at all.
+        Serializes against other calls on this same client (see
+        `_control_lock`) and retries up to CONTROL_RETRY_ATTEMPTS times on a
+        connection failure, since the receiver only accepts one client at a
+        time and a refusal is often transient (the previous client finishes
+        quickly). Raises AVR1710ConnectionError only if every attempt fails.
         """
         msg = _build_control_message(name, self._host, self._control_port, zone, para)
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(self._host, self._control_port), timeout=TIMEOUT
-            )
-        except (OSError, asyncio.TimeoutError) as err:
-            raise AVR1710ConnectionError(
-                f"Cannot reach {self._host}:{self._control_port} (receiver may be asleep): {err}"
-            ) from err
+        async with self._control_lock:
+            data = b""
+            last_err: Exception | None = None
+            for attempt in range(CONTROL_RETRY_ATTEMPTS):
+                last_err = None
+                try:
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(self._host, self._control_port), timeout=TIMEOUT
+                    )
+                except (OSError, asyncio.TimeoutError) as err:
+                    last_err = err
+                else:
+                    try:
+                        writer.write(msg)
+                        await writer.drain()
+                        try:
+                            data = await asyncio.wait_for(reader.read(4096), timeout=TIMEOUT)
+                        except asyncio.TimeoutError:
+                            data = b""
+                    except OSError as err:
+                        last_err = err
+                    finally:
+                        writer.close()
+                        with contextlib.suppress(Exception):
+                            await writer.wait_closed()
 
-        try:
-            writer.write(msg)
-            await writer.drain()
-            try:
-                data = await asyncio.wait_for(reader.read(4096), timeout=TIMEOUT)
-            except asyncio.TimeoutError:
-                data = b""
-        finally:
-            writer.close()
-            with contextlib.suppress(Exception):
-                await writer.wait_closed()
+                if last_err is None:
+                    break
+                if attempt < CONTROL_RETRY_ATTEMPTS - 1:
+                    await asyncio.sleep(CONTROL_RETRY_DELAY)
+
+            if last_err is not None:
+                raise AVR1710ConnectionError(
+                    f"Cannot reach {self._host}:{self._control_port} after "
+                    f"{CONTROL_RETRY_ATTEMPTS} attempts (receiver may be asleep, or "
+                    f"another client is holding the single connection slot): {last_err}"
+                ) from last_err
 
         text = data.decode("ascii", errors="replace")
         result: dict[str, str] = {}
@@ -180,6 +179,10 @@ class AVR1710Client:
     async def query_status(self, para: str) -> str | None:
         reply = await self.send_command("query-status", para=para)
         return reply.get("para") or None
+
+    # ---------------------------------------------------------------
+    # Power / source
+    # ---------------------------------------------------------------
 
     async def get_power(self) -> bool | None:
         value = await self.query_status("power")
@@ -196,130 +199,69 @@ class AVR1710Client:
     async def select_source(self, source: str, zone: str = "") -> None:
         await self.send_command("source-selection", zone=zone, para=source)
 
+    # ---------------------------------------------------------------
+    # Volume / mute -- write-only: confirmed real dispatcher commands, but
+    # the firmware structurally never reports real values back for these
+    # (query-status para=volume/mute always returns empty), so there is no
+    # get_volume()/get_mute() here.
+    # ---------------------------------------------------------------
+
+    async def volume_up(self) -> None:
+        await self.send_command("volume-up")
+
+    async def volume_down(self) -> None:
+        await self.send_command("volume-down")
+
+    async def set_mute(self, mute: bool) -> None:
+        await self.send_command("mute-on" if mute else "mute-off")
+
+    async def mute_toggle(self) -> None:
+        await self.send_command("mute-toggle")
+
+    # ---------------------------------------------------------------
+    # Transport -- confirmed real dispatcher commands. No "stop" exists in
+    # the firmware's command table, so there is no media_stop() here.
+    # ---------------------------------------------------------------
+
+    async def media_play(self) -> None:
+        await self.send_command("play")
+
+    async def media_pause(self) -> None:
+        await self.send_command("pause")
+
+    async def media_next(self) -> None:
+        await self.send_command("next")
+
+    async def media_previous(self) -> None:
+        await self.send_command("previous")
+
     async def send_button(self, command: str, zone: str = "") -> None:
         """Send one of the simple remote-button-style commands (see const.REMOTE_COMMANDS)."""
         await self.send_command(command, zone=zone)
-
-    # ---------------------------------------------------------------
-    # DLNA / UPnP (BridgeCo chip)
-    # ---------------------------------------------------------------
-
-    async def _soap_call(self, service: str, action: str, args: dict | None = None) -> str:
-        args = args or {}
-        body_args = "".join(f"<{k}>{v}</{k}>" for k, v in args.items())
-        envelope = (
-            '<?xml version="1.0" encoding="utf-8"?>'
-            '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
-            's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
-            "<s:Body>"
-            f'<u:{action} xmlns:u="urn:schemas-upnp-org:service:{service}:1">'
-            f"{body_args}"
-            f"</u:{action}>"
-            "</s:Body></s:Envelope>"
-        )
-        session = await self._get_session()
-        url = f"http://{self._host}:{self._dlna_port}/{service}/ctrl"
-        headers = {
-            "Content-Type": 'text/xml; charset="utf-8"',
-            "SOAPACTION": f'"urn:schemas-upnp-org:service:{service}:1#{action}"',
-        }
-        try:
-            async with session.post(
-                url, data=envelope, headers=headers, timeout=aiohttp.ClientTimeout(total=TIMEOUT)
-            ) as resp:
-                return await resp.text()
-        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-            raise AVR1710ConnectionError(f"DLNA call {service}#{action} failed: {err}") from err
-
-    @staticmethod
-    def _extract(text: str, tag: str) -> str | None:
-        match = re.search(f"<{tag}>(.*?)</{tag}>", text, re.S)
-        return match.group(1) if match else None
-
-    async def get_volume(self) -> int | None:
-        text = await self._soap_call("RenderingControl", "GetVolume", {"InstanceID": 0, "Channel": "Master"})
-        value = self._extract(text, "CurrentVolume")
-        return int(value) if value is not None else None
-
-    async def set_volume(self, volume: int) -> None:
-        volume = max(0, min(100, int(volume)))
-        await self._soap_call(
-            "RenderingControl", "SetVolume", {"InstanceID": 0, "Channel": "Master", "DesiredVolume": volume}
-        )
-
-    async def get_mute(self) -> bool | None:
-        text = await self._soap_call("RenderingControl", "GetMute", {"InstanceID": 0, "Channel": "Master"})
-        value = self._extract(text, "CurrentMute")
-        return value == "1" if value is not None else None
-
-    async def set_mute(self, mute: bool) -> None:
-        await self._soap_call(
-            "RenderingControl", "SetMute", {"InstanceID": 0, "Channel": "Master", "DesiredMute": 1 if mute else 0}
-        )
-
-    async def get_transport_state(self) -> str | None:
-        text = await self._soap_call("AVTransport", "GetTransportInfo", {"InstanceID": 0})
-        return self._extract(text, "CurrentTransportState")
-
-    async def media_play(self) -> None:
-        await self._soap_call("AVTransport", "Play", {"InstanceID": 0, "Speed": 1})
-
-    async def media_pause(self) -> None:
-        await self._soap_call("AVTransport", "Pause", {"InstanceID": 0})
-
-    async def media_stop(self) -> None:
-        await self._soap_call("AVTransport", "Stop", {"InstanceID": 0})
-
-    async def media_next(self) -> None:
-        await self._soap_call("AVTransport", "Next", {"InstanceID": 0})
-
-    async def media_previous(self) -> None:
-        await self._soap_call("AVTransport", "Previous", {"InstanceID": 0})
 
     # ---------------------------------------------------------------
     # Combined status (used by the DataUpdateCoordinator)
     # ---------------------------------------------------------------
 
     async def async_update_status(self, previous: AVR1710Status | None = None) -> AVR1710Status:
-        """Poll both surfaces and return a best-effort combined snapshot.
+        """Poll power/source and return a snapshot.
 
-        `previous` is the last successfully-merged snapshot (if any). When a
-        surface fails on this particular poll, its fields are carried
-        forward from `previous` instead of being reset to None/unknown --
-        this matters because TCP:10025 only accepts one client at a time
-        (confirmed via live testing), so any single poll can transiently
-        fail there even while the receiver is genuinely on with a known
-        source. Without this carry-forward, every such hiccup would wipe
-        power/source (or volume/mute/transport) back to unknown, even
-        though the overall update below still counts as a "success" (it
-        only raises if BOTH surfaces are unreachable).
+        `previous` is the last successfully-polled snapshot (if any).
+        `send_command`'s own lock+retry already absorbs the common,
+        transient single-client-slot contention case; if a poll still fails
+        after that (a longer outage, or another client holding the port for
+        a while), the last known state is carried forward instead of being
+        reset to unknown. Raises AVR1710ConnectionError only when there is
+        no previous snapshot to fall back on.
         """
         status = AVR1710Status()
-        control_ok = True
-        dlna_ok = True
-
         try:
             status.power_on = await self.get_power()
-            if status.power_on:
-                status.source = await self.get_source()
+            status.source = await self.get_source() if status.power_on else None
         except AVR1710ConnectionError:
-            control_ok = False
-            if previous is not None:
-                status.power_on = previous.power_on
-                status.source = previous.source
-
-        try:
-            status.volume = await self.get_volume()
-            status.muted = await self.get_mute()
-            status.transport_state = await self.get_transport_state()
-        except AVR1710ConnectionError:
-            dlna_ok = False
-            if previous is not None:
-                status.volume = previous.volume
-                status.muted = previous.muted
-                status.transport_state = previous.transport_state
-
-        if not control_ok and not dlna_ok:
-            raise AVR1710ConnectionError(f"Cannot reach {self._host} on either network surface")
+            if previous is None:
+                raise
+            status.power_on = previous.power_on
+            status.source = previous.source
 
         return status

@@ -11,14 +11,7 @@ from homeassistant.const import CONF_HOST, CONF_NAME
 from homeassistant.data_entry_flow import FlowResult
 
 from .api import AVR1710Client, AVR1710ConnectionError
-from .const import (
-    CONF_CONTROL_PORT,
-    CONF_DLNA_PORT,
-    CONTROL_PORT_DEFAULT,
-    DEFAULT_NAME,
-    DLNA_PORT_DEFAULT,
-    DOMAIN,
-)
+from .const import CONF_CONTROL_PORT, CONTROL_PORT_DEFAULT, DEFAULT_NAME, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -27,22 +20,17 @@ STEP_USER_SCHEMA = vol.Schema(
         vol.Required(CONF_HOST): str,
         vol.Optional(CONF_NAME, default=DEFAULT_NAME): str,
         vol.Optional(CONF_CONTROL_PORT, default=CONTROL_PORT_DEFAULT): int,
-        vol.Optional(CONF_DLNA_PORT, default=DLNA_PORT_DEFAULT): int,
     }
 )
 
 
 async def _validate_input(data: dict[str, Any]) -> None:
-    """Confirm at least one of the two network surfaces is reachable."""
+    """Confirm the control port is reachable."""
     client = AVR1710Client(
         host=data[CONF_HOST],
         control_port=data.get(CONF_CONTROL_PORT, CONTROL_PORT_DEFAULT),
-        dlna_port=data.get(CONF_DLNA_PORT, DLNA_PORT_DEFAULT),
     )
-    try:
-        await client.async_update_status()
-    finally:
-        await client.close()
+    await client.async_update_status()
 
 
 class AVR1710ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):

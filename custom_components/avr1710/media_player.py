@@ -10,34 +10,30 @@ from homeassistant.components.media_player import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .api import AVR1710ConnectionError
 from .const import DOMAIN, MANUFACTURER, MODEL, SOURCE_LIST
 from .coordinator import AVR1710Coordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-# DLNA AVTransport CurrentTransportState values -> Home Assistant states.
-_TRANSPORT_STATE_MAP = {
-    "PLAYING": MediaPlayerState.PLAYING,
-    "PAUSED_PLAYBACK": MediaPlayerState.PAUSED,
-    "STOPPED": MediaPlayerState.IDLE,
-    "NO_MEDIA_PRESENT": MediaPlayerState.IDLE,
-    "TRANSITIONING": MediaPlayerState.BUFFERING,
-}
-
+# No VOLUME_SET: the dispatcher only has relative volume-up/volume-down
+# step commands, not an absolute "set volume to X" command. No STOP: no
+# stop command exists anywhere in the dispatcher's command table. Both
+# would have to be faked (e.g. stop mapped to pause) to support, which
+# this integration deliberately avoids -- see api.py's module docstring.
 SUPPORTED_FEATURES = (
     MediaPlayerEntityFeature.TURN_ON
     | MediaPlayerEntityFeature.TURN_OFF
-    | MediaPlayerEntityFeature.VOLUME_SET
     | MediaPlayerEntityFeature.VOLUME_STEP
     | MediaPlayerEntityFeature.VOLUME_MUTE
     | MediaPlayerEntityFeature.SELECT_SOURCE
     | MediaPlayerEntityFeature.PLAY
     | MediaPlayerEntityFeature.PAUSE
-    | MediaPlayerEntityFeature.STOP
     | MediaPlayerEntityFeature.NEXT_TRACK
     | MediaPlayerEntityFeature.PREVIOUS_TRACK
 )
@@ -71,70 +67,73 @@ class AVR1710MediaPlayer(CoordinatorEntity[AVR1710Coordinator], MediaPlayerEntit
 
     @property
     def state(self) -> MediaPlayerState:
-        status = self.coordinator.data
-        if not status.is_likely_on:
-            return MediaPlayerState.OFF
-        if status.transport_state:
-            return _TRANSPORT_STATE_MAP.get(status.transport_state, MediaPlayerState.ON)
-        return MediaPlayerState.ON
-
-    @property
-    def volume_level(self) -> float | None:
-        volume = self.coordinator.data.volume
-        return volume / 100 if volume is not None else None
+        # No DLNA transport-state readback anymore (see api.py), so this can
+        # only distinguish ON/OFF -- not PLAYING/PAUSED/IDLE.
+        return MediaPlayerState.ON if self.coordinator.data.is_likely_on else MediaPlayerState.OFF
 
     @property
     def is_volume_muted(self) -> bool | None:
-        return self.coordinator.data.muted
+        # Write-only: mute-on/mute-off/mute-toggle are real dispatcher
+        # commands, but query-status never reports a real mute value back
+        # (permanently empty by firmware design), so this is always
+        # unknown -- the mute button/service can still be used, it just
+        # won't reflect current state in the UI.
+        return None
 
     @property
     def source(self) -> str | None:
         return self.coordinator.data.source
 
+    async def _async_call(self, action, description: str) -> None:
+        """Run a client action, converting connection failures into a visible HA error.
+
+        Without this, a genuine failure (e.g. an external client holding the
+        receiver's single TCP:10025 connection slot for a long time) would
+        raise AVR1710ConnectionError straight out of a service call, which
+        Home Assistant does surface, but with a confusing internal message.
+        This re-raises it as a clear, user-facing HomeAssistantError instead.
+        """
+        try:
+            await action
+        except AVR1710ConnectionError as err:
+            raise HomeAssistantError(f"Harman Kardon AVR 1710: failed to {description}: {err}") from err
+
     async def async_turn_on(self) -> None:
-        await self.coordinator.client.set_power(True)
+        await self._async_call(self.coordinator.client.set_power(True), "turn on")
         await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self) -> None:
-        await self.coordinator.client.set_power(False)
+        await self._async_call(self.coordinator.client.set_power(False), "turn off")
         await self.coordinator.async_request_refresh()
 
     async def async_select_source(self, source: str) -> None:
-        await self.coordinator.client.select_source(source)
-        await self.coordinator.async_request_refresh()
-
-    async def async_set_volume_level(self, volume: float) -> None:
-        await self.coordinator.client.set_volume(round(volume * 100))
+        await self._async_call(self.coordinator.client.select_source(source), f"select source {source!r}")
         await self.coordinator.async_request_refresh()
 
     async def async_volume_up(self) -> None:
-        await self.coordinator.client.send_command("volume-up")
+        await self._async_call(self.coordinator.client.volume_up(), "increase volume")
         await self.coordinator.async_request_refresh()
 
     async def async_volume_down(self) -> None:
-        await self.coordinator.client.send_command("volume-down")
+        await self._async_call(self.coordinator.client.volume_down(), "decrease volume")
         await self.coordinator.async_request_refresh()
 
     async def async_mute_volume(self, mute: bool) -> None:
-        await self.coordinator.client.set_mute(mute)
+        await self._async_call(self.coordinator.client.set_mute(mute), "set mute")
         await self.coordinator.async_request_refresh()
 
     async def async_media_play(self) -> None:
-        await self.coordinator.client.media_play()
+        await self._async_call(self.coordinator.client.media_play(), "play")
         await self.coordinator.async_request_refresh()
 
     async def async_media_pause(self) -> None:
-        await self.coordinator.client.media_pause()
-        await self.coordinator.async_request_refresh()
-
-    async def async_media_stop(self) -> None:
-        await self.coordinator.client.media_stop()
+        await self._async_call(self.coordinator.client.media_pause(), "pause")
         await self.coordinator.async_request_refresh()
 
     async def async_media_next_track(self) -> None:
-        await self.coordinator.client.media_next()
+        await self._async_call(self.coordinator.client.media_next(), "skip to next track")
         await self.coordinator.async_request_refresh()
 
     async def async_media_previous_track(self) -> None:
-        await self.coordinator.client.media_previous()
+        await self._async_call(self.coordinator.client.media_previous(), "skip to previous track")
         await self.coordinator.async_request_refresh()

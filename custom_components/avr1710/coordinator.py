@@ -15,7 +15,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class AVR1710Coordinator(DataUpdateCoordinator[AVR1710Status]):
-    """Polls both network surfaces on a fixed interval."""
+    """Polls the TCP:10025 control port on a fixed interval."""
 
     def __init__(self, hass: HomeAssistant, client: AVR1710Client, entry: ConfigEntry) -> None:
         super().__init__(

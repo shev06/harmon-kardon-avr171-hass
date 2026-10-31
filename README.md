@@ -7,20 +7,32 @@ integration** — not published or endorsed by Harman Kardon.
 
 ## What it uses
 
-The receiver exposes two independent, already-shipping network APIs (no
-firmware modification needed to use either one):
+The receiver exposes **TCP:10025**, a proprietary XML command dispatcher
+built into the receiver's main firmware (no firmware modification needed to
+use it). This integration talks to that single API only:
 
-1. **TCP:10025** — a proprietary XML command dispatcher built into the
-   receiver's main firmware. Used here for **power on/off, source
-   selection (24 named inputs), and ~20 remote-button commands**
-   (menu/transport/tone/etc.).
-2. **DLNA/UPnP (port 8080)** — a standard `MediaRenderer:1` stack hosted on
-   a separate network-bridge chip. Used here for **volume, mute, and
-   transport (play/pause/stop/next/previous) get+set**, because the
-   proprietary dispatcher's own status replies for volume/mute are always
-   empty by firmware design (those code paths never compute a value to
-   report — a pre-existing firmware limitation, not something this
-   integration can work around without a flashed binary patch).
+- **Power** on/off/toggle, with readback (query-status).
+- **Source selection** — 24 named inputs, with readback.
+- **Volume** — relative step up/down only. The firmware has no "set volume
+  to X" command, and its status replies for volume are always empty (that
+  code path never computes a value to report), so there is no volume
+  slider and no volume-level display.
+- **Mute** — on/off/toggle. Also write-only: the firmware never reports
+  real mute state back, so the mute control won't reflect current state in
+  the UI, but it does work.
+- **Transport** — play/pause/next/previous. There is no "stop" command
+  anywhere in the firmware's command table, so it isn't exposed (faking it
+  with pause would be misleading). No fine-grained playing/paused/idle
+  state readback either — the entity only distinguishes on/off.
+- ~20 other simple remote-button commands (menu/tone/delay/etc.) via the
+  `remote` entity.
+
+An earlier version of this integration also used the receiver's separate
+DLNA/UPnP surface (port 8080, a different network-bridge chip) to get real
+numeric volume and boolean mute state. That's been dropped by choice to
+keep the integration to a single, simpler network surface — the trade-off
+documented above (no volume level or mute-state display, no stop, no
+playing/paused readback) is the result.
 
 ## Installation
 
@@ -40,34 +52,32 @@ service: remote.send_command
 target:
   entity_id: remote.avr_1710
 data:
-  command: home   # or: options, setting, sleep, tone, delay, rds,
-                  # tune-up, tune-down, channel-up, channel-down,
+  command: home   # or: mute-toggle, options, setting, sleep, tone, delay,
+                  # rds, tune-up, tune-down, channel-up, channel-down,
                   # audio-effect, video-mode, surround-mode,
                   # up/down/left/right/ok/back/forward/reverse
 ```
 
 ## Known limitations (found during live testing, not assumptions)
 
-- **TCP:10025 appears to accept only one client connection at a time.**
-  If you have another app or an open telnet/nc session connected to that
-  port, every other client's connection attempt (including this
-  integration's polling) will be refused until it closes. This
-  integration already opens a connection, sends one command, reads the
-  reply, and closes immediately — it never holds the port open — but it
-  still can't win against another client already occupying the single
-  slot. If `power`/`source` look stuck or unavailable, check for another
-  open connection to port 10025 first. Since v1.0.1, a single refused poll
-  no longer resets `power`/`source` (or `volume`/`mute`/`transport` if DLNA
-  has the hiccup instead) back to unknown — the last known-good value is
-  kept until the next successful poll updates it.
-- **When the control port can't be reached at all**, this integration
-  does **not** assume the receiver is off (live testing showed the port
-  can refuse connections even while the receiver is genuinely on). Instead
-  it falls back to DLNA reachability to decide on/off, and only shows the
-  entity as truly `unavailable` if *neither* API responds.
-- **Volume/mute readback always comes from DLNA**, not the proprietary
-  dispatcher (see "What it uses" above) — this is correct and expected,
-  not a bug.
+- **TCP:10025 accepts only one client connection at a time.** If another
+  app or an open telnet/nc session is connected to that port, any other
+  client's connection attempt will be refused until it closes. Since this
+  integration's own periodic poll and any user-triggered command (turn
+  on/off, select source, ...) both use that same single slot, they can
+  race each other too — not just external clients. To absorb this, every
+  call is serialized through a lock and retried a few times before giving
+  up; if you still see an occasional failure surfaced as an error (rather
+  than a silently stale state — fixed in v1.0.1), it means something else
+  held the port open for longer than the retry window.
+- **No volume level, mute state, or playing/paused/idle readback.** These
+  are permanent firmware limitations on TCP:10025 (see "What it uses"
+  above), not bugs in this integration. Volume step, mute, and
+  play/pause/next/previous still work — you just won't see a slider,
+  mute indicator, or transport state reflected back in the UI.
+- **No volume slider or stop button.** The firmware has no absolute
+  "set volume" or "stop" command, so `VOLUME_SET`/`STOP` aren't claimed as
+  supported features (faking them would be misleading).
 - **Turning the receiver on over the network is not guaranteed from deep
   standby.** The firmware aggressively clock-gates the main MCU to save
   power; depending on how long it's been idle, `power-on` may not reach it
@@ -85,8 +95,8 @@ data:
 ```
 custom_components/avr1710/
 ├── __init__.py       # entry setup/teardown, platform forwarding
-├── api.py            # standalone async client for both network surfaces
-├── config_flow.py    # UI setup (host/name/ports)
+├── api.py            # standalone async client for the TCP:10025 dispatcher
+├── config_flow.py    # UI setup (host/name/port)
 ├── const.py          # domain, defaults, source list, button command list
 ├── coordinator.py     # polling DataUpdateCoordinator (10s interval)
 ├── media_player.py    # power/volume/mute/source/transport entity

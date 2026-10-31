@@ -6,7 +6,7 @@ from homeassistant.const import CONF_HOST, Platform
 from homeassistant.core import HomeAssistant
 
 from .api import AVR1710Client
-from .const import CONF_CONTROL_PORT, CONF_DLNA_PORT, CONTROL_PORT_DEFAULT, DLNA_PORT_DEFAULT, DOMAIN
+from .const import CONF_CONTROL_PORT, CONTROL_PORT_DEFAULT, DOMAIN
 from .coordinator import AVR1710Coordinator
 
 PLATFORMS: list[Platform] = [Platform.MEDIA_PLAYER, Platform.REMOTE]
@@ -17,7 +17,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     client = AVR1710Client(
         host=entry.data[CONF_HOST],
         control_port=entry.data.get(CONF_CONTROL_PORT, CONTROL_PORT_DEFAULT),
-        dlna_port=entry.data.get(CONF_DLNA_PORT, DLNA_PORT_DEFAULT),
     )
     coordinator = AVR1710Coordinator(hass, client, entry)
     await coordinator.async_config_entry_first_refresh()

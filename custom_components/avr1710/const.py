@@ -4,10 +4,8 @@ DOMAIN = "avr1710"
 DEFAULT_NAME = "AVR 1710"
 
 CONF_CONTROL_PORT = "control_port"
-CONF_DLNA_PORT = "dlna_port"
 
 CONTROL_PORT_DEFAULT = 10025
-DLNA_PORT_DEFAULT = 8080
 
 DEFAULT_SCAN_INTERVAL = 10  # seconds
 
@@ -47,8 +45,11 @@ SOURCE_LIST = [
 # Confirmed simple "button" style top-level dispatcher commands (no `para`
 # needed) that aren't already covered by the media_player platform
 # (power/volume/mute/source/transport) -- exposed via the `remote` platform
-# for automations and dashboards.
+# for automations and dashboards. mute-toggle is included here (rather than
+# only exposing mute-on/off via media_player) since it's a distinct real
+# command with no other way to reach it.
 REMOTE_COMMANDS = [
+    "mute-toggle",
     "forward",
     "reverse",
     "up",

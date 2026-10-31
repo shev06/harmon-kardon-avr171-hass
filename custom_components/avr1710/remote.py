@@ -17,10 +17,12 @@ from typing import Any, Iterable
 from homeassistant.components.remote import RemoteEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .api import AVR1710ConnectionError
 from .const import DOMAIN, MANUFACTURER, MODEL, REMOTE_COMMANDS
 from .coordinator import AVR1710Coordinator
 
@@ -52,17 +54,24 @@ class AVR1710Remote(CoordinatorEntity[AVR1710Coordinator], RemoteEntity):
     def is_on(self) -> bool:
         return self.coordinator.data.is_likely_on
 
+    async def _async_call(self, action, description: str) -> None:
+        """Run a client action, converting connection failures into a visible HA error."""
+        try:
+            await action
+        except AVR1710ConnectionError as err:
+            raise HomeAssistantError(f"Harman Kardon AVR 1710: failed to {description}: {err}") from err
+
     async def async_turn_on(self, **kwargs: Any) -> None:
-        await self.coordinator.client.set_power(True)
+        await self._async_call(self.coordinator.client.set_power(True), "turn on")
         await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        await self.coordinator.client.set_power(False)
+        await self._async_call(self.coordinator.client.set_power(False), "turn off")
         await self.coordinator.async_request_refresh()
 
     async def async_send_command(self, command: Iterable[str], **kwargs: Any) -> None:
         for single in command:
             if single not in REMOTE_COMMANDS:
                 raise ValueError(f"Unknown command {single!r}; valid commands: {', '.join(REMOTE_COMMANDS)}")
-            await self.coordinator.client.send_button(single)
+            await self._async_call(self.coordinator.client.send_button(single), f"send command {single!r}")
         await self.coordinator.async_request_refresh()
