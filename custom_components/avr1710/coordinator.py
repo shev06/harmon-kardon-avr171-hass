@@ -8,7 +8,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import AVR1710Client, AVR1710ConnectionError, AVR1710Status
+from .api import AVR1710Client, AVR1710ConnectionError, AVR1710ResponseError, AVR1710Status
 from .const import DEFAULT_SCAN_INTERVAL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
@@ -30,5 +30,5 @@ class AVR1710Coordinator(DataUpdateCoordinator[AVR1710Status]):
     async def _async_update_data(self) -> AVR1710Status:
         try:
             return await self.client.async_update_status(previous=self.data)
-        except AVR1710ConnectionError as err:
+        except (AVR1710ConnectionError, AVR1710ResponseError) as err:
             raise UpdateFailed(str(err)) from err

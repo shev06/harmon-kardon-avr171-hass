@@ -6,20 +6,15 @@ unit-tested (or run live against a real receiver) completely standalone.
 TCP:10025 is a proprietary dispatcher reverse-engineered from the receiver's
 own firmware (FUN_08049d90 / FUN_08044dc4), hosted on the receiver's main
 STM32 MCU. It provides: power on/off/toggle, 24 named source inputs,
-query-status for live power/source state, relative volume step (up/down,
-no absolute set), mute on/off/toggle (write-only, no readback), play/pause/
+query-status for live power/source/volume/mute state on patched firmware,
+relative volume step (up/down, no absolute set), mute on/off/toggle, play/pause/
 next/previous (write-only, no "stop" command exists), and ~20 other simple
 remote-button-style commands (menu/tone/delay/etc.).
 
-This integration previously also used the receiver's separate DLNA/UPnP
-surface (port 8080, a different BridgeCo chip) to get real numeric volume
-and boolean mute state, since the dispatcher's own query-status replies for
-those two fields are permanently empty by firmware design (those specific
-call sites never compute a value to send -- confirmed via static analysis).
-DLNA was intentionally dropped (by explicit user choice) to reduce the
-integration down to a single network surface; the trade-off is that volume
-level and mute state can be commanded but never read back, and fine-grained
-transport state (playing/paused/idle) isn't available at all.
+The custom firmware's volume/mute fix reports volume as a percentage (0-100)
+and mute as "on"/"off". Older firmware returns empty values, which remain
+unknown. No DLNA/UPnP connection is used, and fine-grained transport state
+(playing/paused/idle) isn't available.
 
 IMPORTANT, confirmed via live testing against a real device: this port is
 only reliably reachable while the STM32 is NOT in its low-power STOP sleep
@@ -56,12 +51,18 @@ class AVR1710ConnectionError(Exception):
     """Raised when the control port cannot be reached at all."""
 
 
+class AVR1710ResponseError(Exception):
+    """Raised when the receiver reports an invalid status value."""
+
+
 @dataclass
 class AVR1710Status:
     """Snapshot of dispatcher-reported state."""
 
     power_on: bool | None = None
     source: str | None = None
+    volume_level: float | None = None
+    is_volume_muted: bool | None = None
 
     @property
     def is_likely_on(self) -> bool:
@@ -200,11 +201,28 @@ class AVR1710Client:
         await self.send_command("source-selection", zone=zone, para=source)
 
     # ---------------------------------------------------------------
-    # Volume / mute -- write-only: confirmed real dispatcher commands, but
-    # the firmware structurally never reports real values back for these
-    # (query-status para=volume/mute always returns empty), so there is no
-    # get_volume()/get_mute() here.
+    # Volume / mute
     # ---------------------------------------------------------------
+
+    async def get_volume(self) -> float | None:
+        """Read the firmware's percentage as Home Assistant's 0-1 level."""
+        value = await self.query_status("volume")
+        if value is None:
+            return None
+        value = value.strip()
+        if not re.fullmatch(r"[0-9]+", value) or not 0 <= int(value) <= 100:
+            raise AVR1710ResponseError(f"Invalid volume status: {value!r}")
+        return int(value) / 100
+
+    async def get_mute(self) -> bool | None:
+        """Read mute state; empty replies on older firmware remain unknown."""
+        value = await self.query_status("mute")
+        if value is None:
+            return None
+        value = value.strip().lower()
+        if value not in ("on", "off"):
+            raise AVR1710ResponseError(f"Invalid mute status: {value!r}")
+        return value == "on"
 
     async def volume_up(self) -> None:
         await self.send_command("volume-up")
@@ -244,7 +262,7 @@ class AVR1710Client:
     # ---------------------------------------------------------------
 
     async def async_update_status(self, previous: AVR1710Status | None = None) -> AVR1710Status:
-        """Poll power/source and return a snapshot.
+        """Poll power/source/volume/mute and return a snapshot.
 
         `previous` is the last successfully-polled snapshot (if any).
         `send_command`'s own lock+retry already absorbs the common,
@@ -265,11 +283,16 @@ class AVR1710Client:
         status = AVR1710Status()
         try:
             status.power_on = await self.get_power()
-            status.source = await self.get_source() if status.power_on else None
+            if status.power_on:
+                status.source = await self.get_source()
+                status.volume_level = await self.get_volume()
+                status.is_volume_muted = await self.get_mute()
         except AVR1710ConnectionError:
             if previous is None:
                 raise
             status.power_on = False
             status.source = None
+            status.volume_level = None
+            status.is_volume_muted = None
 
         return status

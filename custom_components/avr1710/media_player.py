@@ -72,13 +72,12 @@ class AVR1710MediaPlayer(CoordinatorEntity[AVR1710Coordinator], MediaPlayerEntit
         return MediaPlayerState.ON if self.coordinator.data.is_likely_on else MediaPlayerState.OFF
 
     @property
+    def volume_level(self) -> float | None:
+        return self.coordinator.data.volume_level
+
+    @property
     def is_volume_muted(self) -> bool | None:
-        # Write-only: mute-on/mute-off/mute-toggle are real dispatcher
-        # commands, but query-status never reports a real mute value back
-        # (permanently empty by firmware design), so this is always
-        # unknown -- the mute button/service can still be used, it just
-        # won't reflect current state in the UI.
-        return None
+        return self.coordinator.data.is_volume_muted
 
     @property
     def source(self) -> str | None:

@@ -13,13 +13,12 @@ use it). This integration talks to that single API only:
 
 - **Power** on/off/toggle, with readback (query-status).
 - **Source selection** — 24 named inputs, with readback.
-- **Volume** — relative step up/down only. The firmware has no "set volume
-  to X" command, and its status replies for volume are always empty (that
-  code path never computes a value to report), so there is no volume
-  slider and no volume-level display.
-- **Mute** — on/off/toggle. Also write-only: the firmware never reports
-  real mute state back, so the mute control won't reflect current state in
-  the UI, but it does work.
+- **Volume** — relative step up/down, with live volume-level readback on
+  firmware with the volume/mute status fix. The reported percentage is
+  converted to Home Assistant's 0-1 volume level. There is no absolute
+  "set volume to X" command, so no set-volume slider is exposed.
+- **Mute** — on/off/toggle, with live mute-state readback on firmware with
+  the volume/mute status fix, so the mute control reflects current state.
 - **Transport** — play/pause/next/previous. There is no "stop" command
   anywhere in the firmware's command table, so it isn't exposed (faking it
   with pause would be misleading). No fine-grained playing/paused/idle
@@ -30,9 +29,11 @@ use it). This integration talks to that single API only:
 An earlier version of this integration also used the receiver's separate
 DLNA/UPnP surface (port 8080, a different network-bridge chip) to get real
 numeric volume and boolean mute state. That's been dropped by choice to
-keep the integration to a single, simpler network surface — the trade-off
-documented above (no volume level or mute-state display, no stop, no
-playing/paused readback) is the result.
+keep the integration to a single, simpler network surface. As of v1.2.0,
+volume and mute are read directly from TCP:10025 when the custom firmware's
+volume/mute status fix is installed. Older firmware's empty replies remain
+unknown; power/source and existing controls continue to work. Stop and
+playing/paused readback remain unsupported.
 
 ## Installation
 
@@ -69,11 +70,10 @@ data:
   call is serialized through a lock and retried a few times before giving
   up; if you still see an occasional failure surfaced as an error, it means
   something else held the port open for longer than the retry window.
-- **No volume level, mute state, or playing/paused/idle readback.** These
-  are permanent firmware limitations on TCP:10025 (see "What it uses"
-  above), not bugs in this integration. Volume step, mute, and
-  play/pause/next/previous still work — you just won't see a slider,
-  mute indicator, or transport state reflected back in the UI.
+- **Volume and mute readback require the custom firmware's volume/mute
+  status fix.** Older firmware returns empty values, so those attributes
+  remain unknown. Playing/paused/idle readback is unavailable on either
+  firmware; the entity only distinguishes on/off.
 - **No volume slider or stop button.** The firmware has no absolute
   "set volume" or "stop" command, so `VOLUME_SET`/`STOP` aren't claimed as
   supported features (faking them would be misleading).
