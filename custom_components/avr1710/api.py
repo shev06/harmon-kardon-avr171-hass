@@ -28,8 +28,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+
+_LOGGER = logging.getLogger(__name__)
 
 CONTROL_PORT_DEFAULT = 10025
 TIMEOUT = 5
@@ -68,10 +71,8 @@ class AVR1710Status:
     def is_likely_on(self) -> bool:
         """True only when the control port has confirmed the receiver is on.
 
-        There is only one source of truth now (TCP:10025's query-status/
-        power); if it's unknown (control port unreachable even after
-        `send_command`'s retries), this conservatively reports "not on"
-        rather than guessing from a second surface.
+        Failed power polls raise an update error rather than publishing
+        a snapshot with guessed power state.
         """
         return bool(self.power_on)
 
@@ -179,17 +180,22 @@ class AVR1710Client:
 
     async def query_status(self, para: str) -> str | None:
         reply = await self.send_command("query-status", para=para)
+        if reply.get("name") != para or "para" not in reply:
+            raise AVR1710ResponseError(f"Invalid {para} status reply: {reply!r}")
         return reply.get("para") or None
 
     # ---------------------------------------------------------------
     # Power / source
     # ---------------------------------------------------------------
 
-    async def get_power(self) -> bool | None:
+    async def get_power(self) -> bool:
         value = await self.query_status("power")
         if value is None:
-            return None
-        return value.strip().lower() == "on"
+            raise AVR1710ResponseError("Power status is empty")
+        value = value.strip().lower()
+        if value not in ("on", "off"):
+            raise AVR1710ResponseError(f"Invalid power status: {value!r}")
+        return value == "on"
 
     async def get_source(self) -> str | None:
         return await self.query_status("source")
@@ -264,35 +270,29 @@ class AVR1710Client:
     async def async_update_status(self, previous: AVR1710Status | None = None) -> AVR1710Status:
         """Poll power/source/volume/mute and return a snapshot.
 
-        `previous` is the last successfully-polled snapshot (if any).
-        `send_command`'s own lock+retry already absorbs the common,
-        transient single-client-slot contention case. If a poll still fails
-        after that, confirmed live (see README "Known limitations"): this
-        receiver's control port goes completely dark -- connection
-        refused/timeout, not even ICMP ping responds -- once it's genuinely
-        in standby, and nothing at the protocol level distinguishes "asleep"
-        from "a longer network outage". So once at least one poll has ever
-        succeeded, a later connection failure is reported as power_on=False
-        (standby) rather than being carried forward as stale "on" -- it
-        used to be carried forward, but that meant the receiver could sit
-        in real standby for hours while still showing "on". Raises
-        AVR1710ConnectionError only when there is no previous snapshot at
-        all (the very first poll), which config_flow's setup validation
-        relies on to detect "cannot connect".
+        Only an explicit power reply determines on/off. An unreachable or
+        invalid power reply raises, allowing Home Assistant to mark the
+        entity unavailable rather than guessing standby. Once power is
+        confirmed on, auxiliary query failures retain unread fields from
+        the previous on-state snapshot and are logged for diagnosis.
         """
-        status = AVR1710Status()
+        power_on = await self.get_power()
+        if not power_on:
+            return AVR1710Status(power_on=False)
+
+        status = (
+            replace(previous, power_on=True)
+            if previous is not None and previous.power_on
+            else AVR1710Status(power_on=True)
+        )
         try:
-            status.power_on = await self.get_power()
-            if status.power_on:
-                status.source = await self.get_source()
-                status.volume_level = await self.get_volume()
-                status.is_volume_muted = await self.get_mute()
-        except AVR1710ConnectionError:
-            if previous is None:
-                raise
-            status.power_on = False
-            status.source = None
-            status.volume_level = None
-            status.is_volume_muted = None
+            status.source = await self.get_source()
+            status.volume_level = await self.get_volume()
+            status.is_volume_muted = await self.get_mute()
+        except (AVR1710ConnectionError, AVR1710ResponseError) as err:
+            _LOGGER.warning(
+                "Receiver confirmed on, but auxiliary status poll failed; "
+                "retaining last-known values for unread fields: %s", err,
+            )
 
         return status

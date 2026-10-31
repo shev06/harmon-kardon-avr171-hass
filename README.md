@@ -70,6 +70,13 @@ data:
   call is serialized through a lock and retried a few times before giving
   up; if you still see an occasional failure surfaced as an error, it means
   something else held the port open for longer than the retry window.
+- **Power state requires an explicit `on`/`off` reply.** As of v1.2.1,
+  failed source/volume/mute queries cannot overwrite a confirmed `on`
+  state. Their unread fields retain last-known values and a warning is
+  logged. Missing, invalid, or unreachable power replies mark the entity
+  **unavailable**, not off: network failure alone cannot distinguish
+  standby from a connection problem. The next successful poll restores
+  availability.
 - **Volume and mute readback require the custom firmware's volume/mute
   status fix.** Older firmware returns empty values, so those attributes
   remain unknown. Playing/paused/idle readback is unavailable on either
@@ -85,8 +92,8 @@ data:
   firmware/hardware limitation, not something this integration can patch
   around — you'll need the IR remote or front panel to wake it, after
   which Home Assistant will pick the "on" state back up on its next poll
-  (every 10s). As of v1.1.1, the entity correctly shows **off** while the
-  receiver is asleep (it used to get stuck showing stale "on").
+  (every 10s). When the sleeping receiver cannot report power state, the
+  entity is **unavailable** rather than incorrectly inferring off.
 - **Turning the receiver off over the network may be slower than
   expected.** Sending `power-off` is accepted immediately, but live
   testing has seen the receiver stay fully reachable and reporting "on"
