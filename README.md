@@ -67,9 +67,8 @@ data:
   on/off, select source, ...) both use that same single slot, they can
   race each other too — not just external clients. To absorb this, every
   call is serialized through a lock and retried a few times before giving
-  up; if you still see an occasional failure surfaced as an error (rather
-  than a silently stale state — fixed in v1.0.1), it means something else
-  held the port open for longer than the retry window.
+  up; if you still see an occasional failure surfaced as an error, it means
+  something else held the port open for longer than the retry window.
 - **No volume level, mute state, or playing/paused/idle readback.** These
   are permanent firmware limitations on TCP:10025 (see "What it uses"
   above), not bugs in this integration. Volume step, mute, and
@@ -78,10 +77,22 @@ data:
 - **No volume slider or stop button.** The firmware has no absolute
   "set volume" or "stop" command, so `VOLUME_SET`/`STOP` aren't claimed as
   supported features (faking them would be misleading).
-- **Turning the receiver on over the network is not guaranteed from deep
-  standby.** The firmware aggressively clock-gates the main MCU to save
-  power; depending on how long it's been idle, `power-on` may not reach it
-  the same way IR/front-panel power-on does.
+- **The receiver cannot be turned on over the network once it's actually
+  asleep — confirmed live, not a guess.** Putting the receiver into
+  standby via the remote/front panel makes TCP:10025 go completely dark
+  (connection refused/timeout; even ICMP ping stops responding), so there
+  is no way to send it a wake command from Home Assistant. This is a
+  firmware/hardware limitation, not something this integration can patch
+  around — you'll need the IR remote or front panel to wake it, after
+  which Home Assistant will pick the "on" state back up on its next poll
+  (every 10s). As of v1.1.1, the entity correctly shows **off** while the
+  receiver is asleep (it used to get stuck showing stale "on").
+- **Turning the receiver off over the network may be slower than
+  expected.** Sending `power-off` is accepted immediately, but live
+  testing has seen the receiver stay fully reachable and reporting "on"
+  for 20+ seconds afterwards before going to sleep. If you need
+  confirmation the receiver actually went to standby, don't assume it's
+  instant.
 
 ## Source list (exact strings the firmware expects)
 

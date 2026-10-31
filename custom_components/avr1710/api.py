@@ -248,11 +248,19 @@ class AVR1710Client:
 
         `previous` is the last successfully-polled snapshot (if any).
         `send_command`'s own lock+retry already absorbs the common,
-        transient single-client-slot contention case; if a poll still fails
-        after that (a longer outage, or another client holding the port for
-        a while), the last known state is carried forward instead of being
-        reset to unknown. Raises AVR1710ConnectionError only when there is
-        no previous snapshot to fall back on.
+        transient single-client-slot contention case. If a poll still fails
+        after that, confirmed live (see README "Known limitations"): this
+        receiver's control port goes completely dark -- connection
+        refused/timeout, not even ICMP ping responds -- once it's genuinely
+        in standby, and nothing at the protocol level distinguishes "asleep"
+        from "a longer network outage". So once at least one poll has ever
+        succeeded, a later connection failure is reported as power_on=False
+        (standby) rather than being carried forward as stale "on" -- it
+        used to be carried forward, but that meant the receiver could sit
+        in real standby for hours while still showing "on". Raises
+        AVR1710ConnectionError only when there is no previous snapshot at
+        all (the very first poll), which config_flow's setup validation
+        relies on to detect "cannot connect".
         """
         status = AVR1710Status()
         try:
@@ -261,7 +269,7 @@ class AVR1710Client:
         except AVR1710ConnectionError:
             if previous is None:
                 raise
-            status.power_on = previous.power_on
-            status.source = previous.source
+            status.power_on = False
+            status.source = None
 
         return status
