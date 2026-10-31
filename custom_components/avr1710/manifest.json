@@ -1,0 +1,12 @@
+{
+  "domain": "avr1710",
+  "name": "Harman Kardon AVR 1710",
+  "codeowners": ["@shev06"],
+  "config_flow": true,
+  "documentation": "https://github.com/shev06/harmon-kardon-avr171-hass",
+  "issue_tracker": "https://github.com/shev06/harmon-kardon-avr171-hass/issues",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "requirements": [],
+  "version": "1.0.0"
+}
