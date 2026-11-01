@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import re
 from dataclasses import dataclass, replace
 
@@ -40,8 +41,9 @@ TIMEOUT = 5
 # so this integration's own periodic poll and any user-triggered command can
 # race each other (and any external client) for that single slot and lose,
 # even though the receiver is genuinely reachable and on.
-CONTROL_RETRY_ATTEMPTS = 3
-CONTROL_RETRY_DELAY = 0.4  # seconds between retries
+CONTROL_RETRY_ATTEMPTS = 5
+CONTROL_RETRY_DELAY = 0.4  # initial retry delay; doubles after each refusal
+CONTROL_RECONNECT_DELAY = 0.5  # allow the receiver to release its single client slot
 
 _TAG_PATTERNS = {
     "name": re.compile(r"<name>(.*?)</name>", re.S),
@@ -109,6 +111,8 @@ class AVR1710Client:
         # this integration never contends with itself for the receiver's
         # single TCP:10025 client slot -- see CONTROL_RETRY_ATTEMPTS above.
         self._control_lock = asyncio.Lock()
+        self._control_ready_at = 0.0
+        self._volume_lock = asyncio.Lock()
 
     async def close(self) -> None:
         """No persistent resources to release; kept for API symmetry with callers."""
@@ -136,6 +140,7 @@ class AVR1710Client:
             data = b""
             last_err: Exception | None = None
             for attempt in range(CONTROL_RETRY_ATTEMPTS):
+                await asyncio.sleep(max(0, self._control_ready_at - asyncio.get_running_loop().time()))
                 last_err = None
                 try:
                     reader, writer = await asyncio.wait_for(
@@ -157,11 +162,14 @@ class AVR1710Client:
                         writer.close()
                         with contextlib.suppress(Exception):
                             await writer.wait_closed()
+                        self._control_ready_at = (
+                            asyncio.get_running_loop().time() + CONTROL_RECONNECT_DELAY
+                        )
 
                 if last_err is None:
                     break
                 if attempt < CONTROL_RETRY_ATTEMPTS - 1:
-                    await asyncio.sleep(CONTROL_RETRY_DELAY)
+                    await asyncio.sleep(CONTROL_RETRY_DELAY * 2 ** attempt)
 
             if last_err is not None:
                 raise AVR1710ConnectionError(
@@ -235,6 +243,46 @@ class AVR1710Client:
 
     async def volume_down(self) -> None:
         await self.send_command("volume-down")
+
+    async def set_volume(self, level: float) -> None:
+        """Reach a percentage target using bounded steps and actual readback."""
+        if not math.isfinite(level) or not 0 <= level <= 1:
+            raise ValueError("Volume level must be between 0 and 1")
+        target = round(level * 100)
+        async with self._volume_lock:
+            try:
+                async with asyncio.timeout(300):
+                    if not await self.get_power():
+                        raise AVR1710ResponseError("Cannot set volume while receiver is off")
+                    current = await self.get_volume()
+                    if current is None:
+                        raise AVR1710ResponseError("Volume slider requires volume readback")
+                    unchanged = 0
+                    for _ in range(200):
+                        percent = round(current * 100)
+                        if percent == target:
+                            return
+                        increasing = percent < target
+                        await (self.volume_up() if increasing else self.volume_down())
+                        await asyncio.sleep(0.1)
+                        if not await self.get_power():
+                            raise AVR1710ResponseError("Receiver turned off while setting volume")
+                        updated = await self.get_volume()
+                        if updated is None:
+                            raise AVR1710ResponseError("Volume readback lost while setting volume")
+                        if (increasing and updated < current) or (not increasing and updated > current):
+                            raise AVR1710ResponseError("Volume moved opposite to the requested direction")
+                        unchanged = unchanged + 1 if updated == current else 0
+                        if unchanged >= 4:
+                            raise AVR1710ResponseError("Volume stopped changing before reaching target")
+                        current = updated
+                        if (increasing and round(current * 100) >= target) or (
+                            not increasing and round(current * 100) <= target
+                        ):
+                            return
+                    raise AVR1710ResponseError("Volume target not reached within 200 steps")
+            except TimeoutError as err:
+                raise AVR1710ResponseError("Volume target not reached within 300 seconds") from err
 
     async def set_mute(self, mute: bool) -> None:
         await self.send_command("mute-on" if mute else "mute-off")

@@ -1,9 +1,10 @@
 """Standalone tests for patched-firmware status readback."""
 import importlib.util
 import sys
+import time
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock, Mock, call, patch
 
 API_PATH = Path(__file__).parents[1] / "custom_components" / "avr1710" / "api.py"
 SPEC = importlib.util.spec_from_file_location("avr1710_api", API_PATH)
@@ -142,3 +143,126 @@ class StatusTests(unittest.IsolatedAsyncioTestCase):
                 self.client.send_command.return_value = reply
                 with self.assertRaises(api.AVR1710ResponseError):
                     await self.client.query_status("power")
+
+
+class VolumeSliderTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.client = api.AVR1710Client("192.0.2.1")
+        self.client.get_power = AsyncMock(return_value=True)
+        self.client.get_volume = AsyncMock()
+        self.client.volume_up = AsyncMock()
+        self.client.volume_down = AsyncMock()
+        sleep = patch.object(api.asyncio, "sleep", new_callable=AsyncMock)
+        sleep.start()
+        self.addCleanup(sleep.stop)
+
+    async def test_reaches_target_in_both_directions(self):
+        for readings, target, command in (
+            ([0.54, 0.54, 0.55, 0.56], 0.56, self.client.volume_up),
+            ([0.56, 0.55, 0.54], 0.54, self.client.volume_down),
+            ([0.01, 0.0], 0.0, self.client.volume_down),
+            ([0.99, 1.0], 1.0, self.client.volume_up),
+        ):
+            with self.subTest(target=target):
+                command.reset_mock()
+                self.client.get_volume.side_effect = readings
+                await self.client.set_volume(target)
+                self.assertEqual(command.await_count, len(readings) - 1)
+
+    async def test_already_at_target_sends_no_steps(self):
+        self.client.get_volume.return_value = 0.54
+        await self.client.set_volume(0.54)
+        self.client.volume_up.assert_not_awaited()
+        self.client.volume_down.assert_not_awaited()
+
+    async def test_invalid_targets_send_no_commands(self):
+        for target in (-0.1, 1.1, float("nan"), float("inf")):
+            with self.subTest(target=target):
+                with self.assertRaises(ValueError):
+                    await self.client.set_volume(target)
+        self.client.get_power.assert_not_awaited()
+
+    async def test_stalled_volume_stops(self):
+        self.client.get_volume.return_value = 0.54
+        with self.assertRaisesRegex(api.AVR1710ResponseError, "stopped changing"):
+            await self.client.set_volume(0.6)
+        self.assertEqual(self.client.volume_up.await_count, 4)
+
+    async def test_missing_readback_stops_without_blind_steps(self):
+        for readings, expected_steps in (([None], 0), ([0.54, None], 1)):
+            with self.subTest(readings=readings):
+                self.client.volume_up.reset_mock()
+                self.client.get_volume.side_effect = readings
+                with self.assertRaises(api.AVR1710ResponseError):
+                    await self.client.set_volume(0.6)
+                self.assertEqual(self.client.volume_up.await_count, expected_steps)
+
+    async def test_power_off_prevents_and_interrupts_adjustment(self):
+        for powers, steps in (([False], 0), ([True, False], 1)):
+            with self.subTest(powers=powers):
+                self.client.volume_up.reset_mock()
+                self.client.get_power.side_effect = powers
+                self.client.get_volume.return_value = 0.54
+                with self.assertRaises(api.AVR1710ResponseError):
+                    await self.client.set_volume(0.6)
+                self.assertEqual(self.client.volume_up.await_count, steps)
+
+    async def test_opposite_movement_stops(self):
+        self.client.get_volume.side_effect = [0.54, 0.53]
+        with self.assertRaisesRegex(api.AVR1710ResponseError, "opposite"):
+            await self.client.set_volume(0.6)
+        self.client.volume_up.assert_awaited_once()
+
+    async def test_connection_failure_stops_steps(self):
+        self.client.get_volume.side_effect = [
+            0.54, api.AVR1710ConnectionError("Port busy"),
+        ]
+        with self.assertRaises(api.AVR1710ConnectionError):
+            await self.client.set_volume(0.6)
+        self.client.volume_up.assert_awaited_once()
+
+
+class ConnectionPacingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recovers_from_multi_second_listener_interruption(self):
+        reader = Mock()
+        reader.read = AsyncMock(return_value=b"<name>power</name><para>on</para>")
+        writer = Mock()
+        writer.drain = AsyncMock()
+        writer.wait_closed = AsyncMock()
+        client = api.AVR1710Client("192.0.2.1")
+        with (
+            patch.object(api.asyncio, "open_connection", side_effect=[
+                ConnectionRefusedError("Listener busy"),
+                ConnectionRefusedError("Listener busy"),
+                ConnectionRefusedError("Listener busy"),
+                ConnectionRefusedError("Listener busy"),
+                (reader, writer),
+            ]) as connect,
+            patch.object(api.asyncio, "sleep", new_callable=AsyncMock) as sleep,
+        ):
+            self.assertTrue(await client.get_power())
+        self.assertEqual(connect.await_count, 5)
+        delays = [item.args[0] for item in sleep.await_args_list if item.args[0] > 0]
+        self.assertEqual(delays, [0.4, 0.8, 1.6, 3.2])
+
+    async def test_next_connection_waits_for_slot_release(self):
+        opened = []
+        reader = Mock()
+        reader.read = AsyncMock(return_value=b"<name>power</name><para>on</para>")
+        writer = Mock()
+        writer.drain = AsyncMock()
+        writer.wait_closed = AsyncMock()
+
+        async def open_connection(*args):
+            opened.append(time.monotonic())
+            return reader, writer
+
+        client = api.AVR1710Client("192.0.2.1")
+        with (
+            patch.object(api.asyncio, "open_connection", side_effect=open_connection),
+            patch.object(api, "CONTROL_RECONNECT_DELAY", 0.02),
+        ):
+            await client.get_power()
+            await client.get_power()
+        self.assertGreaterEqual(opened[1] - opened[0], 0.02)
+        self.assertEqual(writer.close.call_count, 2)

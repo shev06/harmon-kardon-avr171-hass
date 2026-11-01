@@ -15,21 +15,19 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .api import AVR1710ConnectionError
+from .api import AVR1710ConnectionError, AVR1710ResponseError
 from .const import DOMAIN, MANUFACTURER, MODEL, SOURCE_LIST
 from .coordinator import AVR1710Coordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-# No VOLUME_SET: the dispatcher only has relative volume-up/volume-down
-# step commands, not an absolute "set volume to X" command. No STOP: no
-# stop command exists anywhere in the dispatcher's command table. Both
-# would have to be faked (e.g. stop mapped to pause) to support, which
-# this integration deliberately avoids -- see api.py's module docstring.
+# Volume targets use steps with readback; no native absolute command exists.
+# No STOP: the dispatcher has no stop command.
 SUPPORTED_FEATURES = (
     MediaPlayerEntityFeature.TURN_ON
     | MediaPlayerEntityFeature.TURN_OFF
     | MediaPlayerEntityFeature.VOLUME_STEP
+    | MediaPlayerEntityFeature.VOLUME_SET
     | MediaPlayerEntityFeature.VOLUME_MUTE
     | MediaPlayerEntityFeature.SELECT_SOURCE
     | MediaPlayerEntityFeature.PLAY
@@ -94,7 +92,7 @@ class AVR1710MediaPlayer(CoordinatorEntity[AVR1710Coordinator], MediaPlayerEntit
         """
         try:
             await action
-        except AVR1710ConnectionError as err:
+        except (AVR1710ConnectionError, AVR1710ResponseError) as err:
             raise HomeAssistantError(f"Harman Kardon AVR 1710: failed to {description}: {err}") from err
 
     async def async_turn_on(self) -> None:
@@ -116,6 +114,12 @@ class AVR1710MediaPlayer(CoordinatorEntity[AVR1710Coordinator], MediaPlayerEntit
     async def async_volume_down(self) -> None:
         await self._async_call(self.coordinator.client.volume_down(), "decrease volume")
         await self.coordinator.async_request_refresh()
+
+    async def async_set_volume_level(self, volume: float) -> None:
+        try:
+            await self._async_call(self.coordinator.client.set_volume(volume), "set volume")
+        finally:
+            await self.coordinator.async_request_refresh()
 
     async def async_mute_volume(self, mute: bool) -> None:
         await self._async_call(self.coordinator.client.set_mute(mute), "set mute")

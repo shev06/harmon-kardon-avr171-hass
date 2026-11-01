@@ -11,12 +11,17 @@ The receiver exposes **TCP:10025**, a proprietary XML command dispatcher
 built into the receiver's main firmware (no firmware modification needed to
 use it). This integration talks to that single API only:
 
-- **Power** on/off/toggle, with readback (query-status).
-- **Source selection** — 24 named inputs, with readback.
+- **Power** on/off/toggle, with readback (query-status), polled every 2 seconds.
+- **Source selection** — 20 named inputs, with readback; Source A–D are hidden.
 - **Volume** — relative step up/down, with live volume-level readback on
   firmware with the volume/mute status fix. The reported percentage is
-  converted to Home Assistant's 0-1 volume level. There is no absolute
-  "set volume to X" command, so no set-volume slider is exposed.
+  converted to Home Assistant's 0-1 volume level. The volume slider uses
+  up/down steps with readback to reach the selected percentage (there is
+  no native absolute-volume command). Large changes take multiple steps.
+  **Current live-test limitation:** volume-down changed the reported level,
+  but repeated volume-up commands did not. Until that receiver/firmware
+  behavior is resolved, upward slider changes may fail with a visible
+  "Volume stopped changing" error rather than reach the target.
 - **Mute** — on/off/toggle, with live mute-state readback on firmware with
   the volume/mute status fix, so the mute control reflects current state.
 - **Transport** — play/pause/next/previous. There is no "stop" command
@@ -69,7 +74,9 @@ data:
   race each other too — not just external clients. To absorb this, every
   call is serialized through a lock and retried a few times before giving
   up; if you still see an occasional failure surfaced as an error, it means
-  something else held the port open for longer than the retry window.
+  the receiver remained unreachable beyond the retry window. Connections
+  have a 0.5-second release gap; connection failures retry up to five times
+  with exponential backoff to tolerate multi-second listener interruptions.
 - **Power state requires an explicit `on`/`off` reply.** As of v1.2.1,
   failed source/volume/mute queries cannot overwrite a confirmed `on`
   state. Their unread fields retain last-known values and a warning is
@@ -77,23 +84,35 @@ data:
   **unavailable**, not off: network failure alone cannot distinguish
   standby from a connection problem. The next successful poll restores
   availability.
+- **The polling interval is 2 seconds, not a guaranteed response time.**
+  Full on-state snapshots took about 2.6 seconds in live testing; connection
+  pacing and retries can delay updates further. Actions request an immediate
+  refresh after completion.
 - **Volume and mute readback require the custom firmware's volume/mute
   status fix.** Older firmware returns empty values, so those attributes
   remain unknown. Playing/paused/idle readback is unavailable on either
   firmware; the entity only distinguishes on/off.
-- **No volume slider or stop button.** The firmware has no absolute
-  "set volume" or "stop" command, so `VOLUME_SET`/`STOP` aren't claimed as
-  supported features (faking them would be misleading).
-- **The receiver cannot be turned on over the network once it's actually
-  asleep — confirmed live, not a guess.** Putting the receiver into
-  standby via the remote/front panel makes TCP:10025 go completely dark
-  (connection refused/timeout; even ICMP ping stops responding), so there
-  is no way to send it a wake command from Home Assistant. This is a
-  firmware/hardware limitation, not something this integration can patch
-  around — you'll need the IR remote or front panel to wake it, after
+- **The volume slider requires working volume readback.** It checks power
+  and volume after each step, stops on missing readback, reversed movement,
+  or four unchanged readings, and is bounded to 200 steps / 300 seconds.
+  Errors are surfaced rather than pretending the target was reached.
+  Volume/mute failures still cannot change confirmed power state to off.
+- **No stop button.** The firmware has no stop command.
+- **Standby networking depends on firmware.** With firmware that keeps
+  TCP:10025 online in sleep, the integration polls explicit power state
+  every 2 seconds and can send the existing power-on command. On older
+  firmware, putting the receiver into standby via the remote/front panel
+  made TCP:10025 go completely dark in prior tests (connection refused/
+  timeout; even ICMP ping stopped responding), preventing a network wake
+  command. If the port goes dark, use the IR remote or front panel, after
   which Home Assistant will pick the "on" state back up on its next poll
-  (every 10s). When the sleeping receiver cannot report power state, the
+  (every 2s). When the sleeping receiver cannot report power state, the
   entity is **unavailable** rather than incorrectly inferring off.
+  (With the custom firmware's sleep-disable and CEC-standby patches the
+  receiver was observed to enter its normal "Device sleep" state after a
+  front-panel or HDMI-CEC standby. A stock ~1-hour sleep-to-deep-power-down
+  timer remains and has not been confirmed live, so the receiver may still
+  go dark after about an hour.)
 - **Turning the receiver off over the network may be slower than
   expected.** Sending `power-off` is accepted immediately, but live
   testing has seen the receiver stay fully reachable and reporting "on"
@@ -103,7 +122,7 @@ data:
 
 ## Source list (exact strings the firmware expects)
 
-`Cable Sat`, `Source A`, `Source B`, `Source C`, `Source D`, `Disc`,
+`Cable Sat`, `Disc`,
 `Radio`, `Game`, `Media Server`, `vTuner`, `Home Network`, `Pandora`,
 `iPod`, `Internet Radio`, `Audio`, `Server`, `Sirius Radio`, `DVR`, `TV`,
 `USB`, `AUX`, `FM`, `AM`, `STB`.
@@ -116,7 +135,7 @@ custom_components/avr1710/
 ├── api.py            # standalone async client for the TCP:10025 dispatcher
 ├── config_flow.py    # UI setup (host/name/port)
 ├── const.py          # domain, defaults, source list, button command list
-├── coordinator.py     # polling DataUpdateCoordinator (10s interval)
+├── coordinator.py     # polling DataUpdateCoordinator (2s interval)
 ├── media_player.py    # power/volume/mute/source/transport entity
 ├── remote.py          # raw button-command passthrough entity
 ├── manifest.json

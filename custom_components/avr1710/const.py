@@ -7,7 +7,7 @@ CONF_CONTROL_PORT = "control_port"
 
 CONTROL_PORT_DEFAULT = 10025
 
-DEFAULT_SCAN_INTERVAL = 10  # seconds
+DEFAULT_SCAN_INTERVAL = 2  # seconds
 
 MANUFACTURER = "Harman Kardon"
 MODEL = "AVR 1710"
@@ -17,10 +17,6 @@ MODEL = "AVR 1710"
 # wire; must match these strings exactly (including capitalization).
 SOURCE_LIST = [
     "Cable Sat",
-    "Source A",
-    "Source B",
-    "Source C",
-    "Source D",
     "Disc",
     "Radio",
     "Game",
